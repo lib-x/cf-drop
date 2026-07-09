@@ -1,0 +1,349 @@
+openapi: 3.1.0
+info:
+  title: Cloudflare Drop Preview API
+  version: observed-2026-07-09
+  description: >
+    Observed API contract used by Cloudflare Drop. Provisioning endpoints are
+    internal/observed. Workers assets upload endpoints are documented by
+    Cloudflare Workers Static Assets direct upload docs.
+servers:
+  - url: https://api.cloudflare.com/client/v4
+paths:
+  /provisioning/previews/challenge:
+    post:
+      summary: Request proof-of-work challenge
+      responses:
+        "200":
+          description: Challenge envelope
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ChallengeEnvelope"
+  /provisioning/previews:
+    post:
+      summary: Provision temporary preview credentials
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ProvisionRequest"
+      responses:
+        "200":
+          description: Temporary credentials
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ProvisionEnvelope"
+  /accounts/{accountId}/workers/scripts/{scriptName}/assets-upload-session:
+    post:
+      summary: Start assets upload session
+      parameters:
+        - $ref: "#/components/parameters/AccountId"
+        - $ref: "#/components/parameters/ScriptName"
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [manifest]
+              properties:
+                manifest:
+                  $ref: "#/components/schemas/Manifest"
+      responses:
+        "200":
+          description: Upload token and buckets
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/UploadSessionEnvelope"
+  /accounts/{accountId}/workers/assets/upload:
+    post:
+      summary: Upload base64-encoded asset bucket
+      parameters:
+        - $ref: "#/components/parameters/AccountId"
+        - name: base64
+          in: query
+          required: true
+          schema:
+            type: boolean
+            const: true
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              additionalProperties:
+                type: string
+                format: binary
+      responses:
+        "200":
+          description: Partial upload result
+        "201":
+          description: Final upload result with completion JWT
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/UploadAssetsEnvelope"
+  /provisioning/previews/accounts/{accountId}/scripts/{scriptName}/assets:
+    post:
+      summary: Upload Drop preview assets
+      parameters:
+        - $ref: "#/components/parameters/AccountId"
+        - $ref: "#/components/parameters/ScriptName"
+        - name: base64
+          in: query
+          required: true
+          schema:
+            type: boolean
+            const: true
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [metadata, manifest]
+              properties:
+                metadata:
+                  type: string
+                manifest:
+                  type: string
+              additionalProperties:
+                type: string
+                format: binary
+      responses:
+        "204":
+          description: Assets accepted
+  /accounts/{accountId}/workers/scripts/{scriptName}:
+    put:
+      summary: Deploy assets-only Worker script
+      parameters:
+        - $ref: "#/components/parameters/AccountId"
+        - $ref: "#/components/parameters/ScriptName"
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [metadata]
+              properties:
+                metadata:
+                  type: string
+      responses:
+        "200":
+          description: Script updated
+  /accounts/{accountId}/workers/scripts/{scriptName}/subdomain:
+    post:
+      summary: Enable workers.dev subdomain for script
+      parameters:
+        - $ref: "#/components/parameters/AccountId"
+        - $ref: "#/components/parameters/ScriptName"
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [enabled]
+              properties:
+                enabled:
+                  type: boolean
+      responses:
+        "200":
+          description: Subdomain setting updated
+  /accounts/{accountId}/workers/subdomain:
+    get:
+      summary: Read account workers.dev subdomain
+      parameters:
+        - $ref: "#/components/parameters/AccountId"
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: Account subdomain
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SubdomainEnvelope"
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+  parameters:
+    AccountId:
+      name: accountId
+      in: path
+      required: true
+      schema:
+        type: string
+    ScriptName:
+      name: scriptName
+      in: path
+      required: true
+      schema:
+        type: string
+  schemas:
+    CloudflareError:
+      type: object
+      properties:
+        code:
+          type: integer
+        message:
+          type: string
+    EnvelopeBase:
+      type: object
+      properties:
+        success:
+          type: boolean
+        errors:
+          type: array
+          items:
+            $ref: "#/components/schemas/CloudflareError"
+        messages:
+          type: array
+          items: {}
+    Challenge:
+      type: object
+      required: [challengeToken, seed, k, g]
+      properties:
+        challengeToken:
+          type: string
+        seed:
+          type: string
+        k:
+          type: integer
+        g:
+          type: integer
+        s:
+          type: integer
+        expiresAt:
+          type: integer
+    ChallengeEnvelope:
+      allOf:
+        - $ref: "#/components/schemas/EnvelopeBase"
+        - type: object
+          properties:
+            result:
+              $ref: "#/components/schemas/Challenge"
+    ProvisionRequest:
+      type: object
+      required:
+        - client
+        - source
+        - termsOfService
+        - privacyPolicy
+        - acceptTermsOfService
+        - challengeToken
+        - solution
+      properties:
+        client:
+          type: string
+        source:
+          type: string
+        termsOfService:
+          type: string
+          format: uri
+        privacyPolicy:
+          type: string
+          format: uri
+        acceptTermsOfService:
+          type: string
+          enum: ["yes"]
+        challengeToken:
+          type: string
+        solution:
+          type: object
+          required: [checkpoints]
+          properties:
+            checkpoints:
+              type: string
+    ProvisionResult:
+      type: object
+      properties:
+        account:
+          type: object
+          properties:
+            id:
+              type: string
+            apiToken:
+              type: string
+            expiresAt:
+              type: string
+        claim:
+          type: object
+          properties:
+            token:
+              type: string
+            url:
+              type: string
+            expiresAt:
+              type: string
+    ProvisionEnvelope:
+      allOf:
+        - $ref: "#/components/schemas/EnvelopeBase"
+        - type: object
+          properties:
+            result:
+              $ref: "#/components/schemas/ProvisionResult"
+    Manifest:
+      type: object
+      additionalProperties:
+        type: object
+        required: [hash, size]
+        properties:
+          hash:
+            type: string
+            pattern: "^[a-f0-9]{32}$"
+          size:
+            type: integer
+    UploadSessionResult:
+      type: object
+      properties:
+        jwt:
+          type: string
+        buckets:
+          type: array
+          items:
+            type: array
+            items:
+              type: string
+    UploadSessionEnvelope:
+      allOf:
+        - $ref: "#/components/schemas/EnvelopeBase"
+        - type: object
+          properties:
+            result:
+              $ref: "#/components/schemas/UploadSessionResult"
+    UploadAssetsEnvelope:
+      allOf:
+        - $ref: "#/components/schemas/EnvelopeBase"
+        - type: object
+          properties:
+            result:
+              type: object
+              properties:
+                jwt:
+                  type: string
+    SubdomainEnvelope:
+      allOf:
+        - $ref: "#/components/schemas/EnvelopeBase"
+        - type: object
+          properties:
+            result:
+              type: object
+              properties:
+                subdomain:
+                  type: string

@@ -1,26 +1,28 @@
 package dropclient
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"io"
+	"maps"
 	"mime/multipart"
 	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
-	"sort"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 )
 
-func TestDeployFilesUploadsReturnsURLAndVerifiesAccess(t *testing.T) {
+func TestDeployUploadsReturnsURLAndVerifiesAccess(t *testing.T) {
 	const (
 		accountID        = "account-123"
 		apiToken         = "temporary-api-token"
@@ -37,13 +39,13 @@ func TestDeployFilesUploadsReturnsURLAndVerifiesAccess(t *testing.T) {
 	}))
 	defer siteServer.Close()
 
-	files := []File{
-		{Path: "index.html", Content: []byte("<!doctype html>" + siteMarker), ContentType: "text/html"},
-		{Path: "assets/app.js", Content: []byte("console.log('ok')"), ContentType: "application/javascript"},
-	}
-	manifest, assets, err := BuildManifest(files)
+	source := FromAssets(
+		testAsset("index.html", "<!doctype html>"+siteMarker, "text/html"),
+		testAsset("assets/app.js", "console.log('ok')", "application/javascript"),
+	)
+	manifest, assets, err := buildManifest(t.Context(), source)
 	if err != nil {
-		t.Fatalf("BuildManifest returned error: %v", err)
+		t.Fatalf("buildManifest returned error: %v", err)
 	}
 
 	var state mockAPIState
@@ -61,22 +63,22 @@ func TestDeployFilesUploadsReturnsURLAndVerifiesAccess(t *testing.T) {
 	}))
 	defer apiServer.Close()
 
-	client := New(Options{
-		APIBaseURL: apiServer.URL,
-		HTTPClient: apiServer.Client(),
-		ScriptName: func() (string, error) {
+	client, err := New(
+		WithAPIBaseURL(apiServer.URL),
+		WithHTTPClient(apiServer.Client()),
+		WithScriptNameGenerator(func(context.Context) (string, error) {
 			return scriptName, nil
-		},
-		URLBuilder: func(_, _ string) string {
+		}),
+		WithURLBuilder(func(_, _ string) string {
 			return siteServer.URL
-		},
-	})
-	result, err := client.DeployFiles(context.Background(), files, DeployOptions{
-		AcceptTerms: true,
-		VerifyHTTP:  true,
-	})
+		}),
+	)
 	if err != nil {
-		t.Fatalf("DeployFiles returned error: %v", err)
+		t.Fatalf("New returned error: %v", err)
+	}
+	result, err := client.Deploy(t.Context(), source, AcceptTerms(), VerifyAccess())
+	if err != nil {
+		t.Fatalf("Deploy returned error: %v", err)
 	}
 	if result.URL != siteServer.URL {
 		t.Fatalf("URL = %q, want %q", result.URL, siteServer.URL)
@@ -90,21 +92,30 @@ func TestDeployFilesUploadsReturnsURLAndVerifiesAccess(t *testing.T) {
 	if result.Access == nil || result.Access.StatusCode != http.StatusOK {
 		t.Fatalf("Access = %#v, want HTTP 200", result.Access)
 	}
+	if result.ClaimURL != "https://dash.cloudflare.com/claim/mock" {
+		t.Fatalf("ClaimURL = %q, want mock claim URL", result.ClaimURL)
+	}
+	if result.ClaimExpires.IsZero() {
+		t.Fatal("ClaimExpires is zero")
+	}
 	state.assertCompleted(t)
 }
 
-func TestDeployFilesRequiresTermsAcceptance(t *testing.T) {
-	client := New(Options{})
-	_, err := client.DeployFiles(context.Background(), []File{{Path: "index.html", Content: []byte("ok")}}, DeployOptions{})
-	if err == nil {
-		t.Fatal("DeployFiles returned nil error")
+func TestDeployRequiresTermsAcceptance(t *testing.T) {
+	client, err := New()
+	if err != nil {
+		t.Fatalf("New returned error: %v", err)
 	}
-	if err != ErrTermsNotAccepted {
+	_, err = client.Deploy(t.Context(), FromBytes("index.html", []byte("ok")))
+	if err == nil {
+		t.Fatal("Deploy returned nil error")
+	}
+	if !errors.Is(err, ErrTermsNotAccepted) {
 		t.Fatalf("error = %v, want %v", err, ErrTermsNotAccepted)
 	}
 }
 
-func TestIntegrationDeployFiles(t *testing.T) {
+func TestIntegrationDeploy(t *testing.T) {
 	if os.Getenv("CLOUDFLARE_DROP_INTEGRATION") != "1" {
 		t.Skip("set CLOUDFLARE_DROP_INTEGRATION=1 and CLOUDFLARE_DROP_ACCEPT_TERMS=1 to run live Cloudflare Drop upload")
 	}
@@ -117,29 +128,29 @@ func TestIntegrationDeployFiles(t *testing.T) {
 	if err != nil {
 		t.Fatalf("build live client: %v", err)
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 4*time.Minute)
+	ctx, cancel := context.WithTimeout(t.Context(), 4*time.Minute)
 	defer cancel()
 
-	result, err := client.DeployFiles(ctx, []File{
-		{
-			Path:        "index.html",
-			Content:     []byte("<!doctype html><title>Drop SDK</title><main>" + marker + "</main>"),
-			ContentType: "text/html; charset=utf-8",
-		},
-	}, DeployOptions{
-		AcceptTerms:   true,
-		VerifyHTTP:    true,
-		VerifyTimeout: 2 * time.Minute,
-	})
+	source := FromBytes(
+		"index.html",
+		[]byte("<!doctype html><title>Drop SDK</title><main>"+marker+"</main>"),
+		WithContentType("text/html; charset=utf-8"),
+	)
+	result, err := client.Deploy(ctx, source, AcceptTerms(), WithVerifyTimeout(2*time.Minute))
 	if err != nil {
-		t.Fatalf("live DeployFiles returned error: %v", err)
+		t.Fatalf("live Deploy returned error: %v", err)
 	}
 	body := fetchBodyWithRetry(t, ctx, client.httpClient, result.URL)
 	if !strings.Contains(body, marker) {
 		t.Fatalf("deployed page body does not contain marker %q; body prefix: %q", marker, truncate(body, 300))
 	}
+	if result.ClaimURL == "" {
+		t.Fatal("claim URL is empty")
+	}
+	if result.ClaimExpires.IsZero() {
+		t.Fatal("claim expiration is zero")
+	}
 	t.Logf("deployed URL: %s", result.URL)
-	t.Logf("claim URL: %s", result.ClaimURL)
 }
 
 type mockAPIConfig struct {
@@ -321,12 +332,7 @@ func manifestHashes(manifest Manifest) []string {
 	for _, entry := range manifest {
 		set[entry.Hash] = true
 	}
-	hashes := make([]string, 0, len(set))
-	for hash := range set {
-		hashes = append(hashes, hash)
-	}
-	sort.Strings(hashes)
-	return hashes
+	return slices.Sorted(maps.Keys(set))
 }
 
 func assertAssetParts(t *testing.T, r *http.Request, expected map[string]assetPayload) {
@@ -401,6 +407,18 @@ func writeTestFile(t *testing.T, root, rel, content string) {
 	}
 }
 
+func testAsset(path, content, contentType string) Asset {
+	data := []byte(content)
+	return Asset{
+		Path:        path,
+		Size:        int64(len(data)),
+		ContentType: contentType,
+		Open: func() (io.ReadCloser, error) {
+			return io.NopCloser(bytes.NewReader(data)), nil
+		},
+	}
+}
+
 func fetchBodyWithRetry(t *testing.T, ctx context.Context, client *http.Client, targetURL string) string {
 	t.Helper()
 	deadline, ok := ctx.Deadline()
@@ -456,12 +474,12 @@ func clientForLiveIntegration() (*Client, error) {
 		proxyURL = os.Getenv("ALL_PROXY")
 	}
 	if proxyURL == "" {
-		return NewClient()
+		return New()
 	}
-	return NewClient(WithProxyURL(proxyURL))
+	return New(WithProxyURL(proxyURL))
 }
 
-func TestNewClientSupportsFunctionalOptionsAndProxy(t *testing.T) {
+func TestNewSupportsFunctionalOptionsAndProxy(t *testing.T) {
 	proxyServer := newMinimalHTTPProxy(t)
 	defer proxyServer.Close()
 	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -469,12 +487,12 @@ func TestNewClientSupportsFunctionalOptionsAndProxy(t *testing.T) {
 	}))
 	defer target.Close()
 
-	client, err := NewClient(
+	client, err := New(
 		WithProxyURL(proxyServer.URL()),
 		WithAPIBaseURL("http://api.example.test"),
 	)
 	if err != nil {
-		t.Fatalf("NewClient returned error: %v", err)
+		t.Fatalf("New returned error: %v", err)
 	}
 	resp, err := client.httpClient.Get(target.URL)
 	if err != nil {
@@ -549,9 +567,9 @@ func TestWithSOCKS5ProxyRejectsUnavailableProxyAtRequestTime(t *testing.T) {
 	if err := listener.Close(); err != nil {
 		t.Fatalf("close listener: %v", err)
 	}
-	client, err := NewClient(WithSOCKS5Proxy(addr))
+	client, err := New(WithSOCKS5Proxy(addr))
 	if err != nil {
-		t.Fatalf("NewClient returned error: %v", err)
+		t.Fatalf("New returned error: %v", err)
 	}
 	_, err = client.httpClient.Get("https://example.com")
 	if err == nil {

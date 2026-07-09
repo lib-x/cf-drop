@@ -2,6 +2,7 @@ package dropclient
 
 import (
 	"bytes"
+	"cmp"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -102,12 +103,12 @@ func (c *Client) requestChallenge(ctx context.Context) (challengeResult, error) 
 	return out.Result, err
 }
 
-func (c *Client) provision(ctx context.Context, challenge challengeResult, solution powSolution, opts DeployOptions) (provisionResult, error) {
+func (c *Client) provision(ctx context.Context, challenge challengeResult, solution powSolution, opts deployOptions) (provisionResult, error) {
 	body := map[string]any{
-		"client":               defaultString(opts.Client, DefaultClientName),
-		"source":               defaultString(opts.Source, DefaultSource),
-		"termsOfService":       defaultString(opts.TermsOfService, DefaultTermsOfService),
-		"privacyPolicy":        defaultString(opts.PrivacyPolicy, DefaultPrivacyPolicy),
+		"client":               defaultString(opts.client, DefaultClientName),
+		"source":               defaultString(opts.source, DefaultSource),
+		"termsOfService":       defaultString(opts.termsOfService, DefaultTermsOfService),
+		"privacyPolicy":        defaultString(opts.privacyPolicy, DefaultPrivacyPolicy),
 		"acceptTermsOfService": "yes",
 		"challengeToken":       challenge.ChallengeToken,
 		"solution":             solution,
@@ -313,10 +314,7 @@ func envelopeStatus(out any) (bool, []cloudflareError) {
 }
 
 func defaultString(v, fallback string) string {
-	if v == "" {
-		return fallback
-	}
-	return v
+	return cmp.Or(v, fallback)
 }
 
 func escapeQuotes(s string) string {

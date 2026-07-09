@@ -7,6 +7,28 @@ official Workers Static Assets direct-upload documentation.
 Status: observed/internal for provisioning preview endpoints, documented for
 Workers assets direct-upload endpoints.
 
+## Official Product Behavior
+
+Cloudflare's July 8, 2026 changelog describes Cloudflare Drop as a way to
+deploy a static site without needing a Cloudflare account to get started.
+Officially documented behavior:
+
+- Accepted input is a folder or ZIP file of static assets, including static
+  HTML, CSS, JavaScript, images, and fonts.
+- The upload returns a temporary live preview that stays live for 1 hour.
+- During that hour, users can test the site, share the preview URL, or claim
+  the deployment to keep it.
+- Claiming requires signing in to Cloudflare or creating a Cloudflare account.
+  A claimed deployment can be moved into an existing account or a new account.
+- Creating a new account requires email verification before continuing.
+- After claiming, Cloudflare surfaces follow-up actions: add or buy a domain,
+  enable Workers observability, enable Markdown for Agents, and control access
+  with Cloudflare Access.
+
+This spec uses the official changelog for product semantics and the observed
+frontend/API traffic for implementation details. The provisioning endpoints
+below remain observed/internal even though the product behavior is public.
+
 ## Scope
 
 Cloudflare Drop deploys a static HTML/CSS/JS site to a temporary Workers
@@ -21,6 +43,8 @@ preview. The frontend flow is:
 7. Mirror assets to the preview provisioning endpoint.
 8. Create/update an assets-only Worker script.
 9. Enable the workers.dev subdomain and return the public URL.
+10. Return a claim URL that can be used to keep the deployment before it
+    expires.
 
 ## Client-Side Limits
 
@@ -35,6 +59,99 @@ The Drop frontend applies these checks before upload:
 | Required entry | `index.html` at root or one top-level directory below root |
 
 The Go SDK mirrors these as validation helpers. Server-side limits may differ.
+
+## Go SDK Interface Design
+
+The SDK exposes one deployment entrypoint:
+
+```go
+client, err := dropclient.New(clientOptions...)
+result, err := client.Deploy(ctx, source, deployOptions...)
+```
+
+The stable input contract is `Source`:
+
+```go
+type Source interface {
+    WalkAssets(context.Context, func(Asset) error) error
+}
+
+type Asset struct {
+    Path        string
+    Size        int64
+    ContentType string
+    Open        func() (io.ReadCloser, error)
+}
+```
+
+Deploy output includes both user-facing addresses:
+
+| Field | Meaning | Sensitivity |
+| --- | --- | --- |
+| `URL` | Temporary workers.dev preview URL. | Public preview URL. |
+| `ClaimURL` | Cloudflare claim URL for keeping the deployment. | Contains a short-lived claim token. |
+| `ClaimExpires` | Claim URL expiration time. | Not secret. |
+| `ExpiresAt` | Temporary account credential expiration time. | Not secret by itself. |
+
+Supported constructors:
+
+| Constructor | Use case | Notes |
+| --- | --- | --- |
+| `FromBytes(path, content, ...)` | generated or in-memory single file | reusable source |
+| `FromReader(path, reader, ...)` | streaming one generated file | one-shot source |
+| `FromAssets(...)` | custom virtual source | caller controls `Open` |
+| `FromFS(fs.FS)` | `embed.FS`, `os.DirFS`, virtual filesystems | regular files only |
+| `FromDir(root)` | local output directory | thin wrapper over `os.DirFS` |
+| `FromZipFile(path)` | local ZIP archive | enforces observed ZIP size limit |
+| `FromZipBytes(content)` | in-memory ZIP archive | reusable source |
+| `FromZipReader(reader)` | ZIP stream | buffers up to `MaxZipSize` |
+| `FromZipReaderAt(readerAt, size)` | ZIP without buffering | preferred for large ZIP inputs |
+
+### Design Rationale And Tradeoffs
+
+- Use one `Deploy(ctx, Source, ...DeployOption)` method instead of one deploy
+  method per input kind. This follows a one-version API shape: new input forms
+  can be added as `Source` constructors without multiplying deploy methods.
+- Use `fs.FS` as the folder abstraction instead of accepting only local paths.
+  This covers `embed.FS`, `os.DirFS`, test filesystems, and virtual filesystems
+  with the same validation and upload path.
+- Use `io.ReaderAt + size` as the zero-copy ZIP contract because Go's
+  `archive/zip` reads the central directory from the end of the archive and
+  requires random access. `FromZipReader` is still provided for convenience, but
+  it must buffer the stream before it can parse the ZIP.
+- Keep `FromReader` for single-file generated content. A plain `io.Reader`
+  cannot represent a folder and cannot safely represent ZIP without buffering,
+  so it is intentionally scoped to one asset.
+- Keep functional options for client and deploy settings. Proxy configuration,
+  custom HTTP clients, script naming, compatibility date, and access
+  verification are independent concerns; options keep the required path small
+  while allowing explicit opt-in behavior.
+- Require `AcceptTerms()` as an explicit deploy option. Provisioning sends
+  Cloudflare terms and privacy acknowledgement, so the SDK does not hide that
+  side effect behind a default.
+- Validate at the source boundary before provisioning. Paths are normalized,
+  `..` traversal is rejected, only regular `fs.FS` and ZIP entries are used,
+  duplicate normalized paths fail, size limits are enforced, and `index.html`
+  is required at the root or one top-level directory below root.
+- Internally the SDK currently buffers asset bytes and base64 strings while
+  building the manifest and multipart requests. That matches the observed Drop
+  API, which hashes `base64(fileBytes) + extension` and uploads base64 multipart
+  parts. The public `Source` interface keeps the door open for a future
+  temp-file or streaming-backed internal implementation without changing
+  callers.
+- Temporary Cloudflare API tokens and claim tokens are treated as secrets and
+  are not logged. Error values include endpoint paths and Cloudflare error
+  messages, not bearer token values.
+
+Rejected alternatives:
+
+| Alternative | Reason rejected |
+| --- | --- |
+| One method per input type | Expands the public surface and makes every new input a new deploy method. |
+| Accept only `[]byte` files | Simple, but excludes folders, `embed.FS`, ZIPs, and virtual filesystems. |
+| Accept only `io.Reader` | Too weak for folders and ZIP central directory parsing. |
+| Accept only local filesystem paths | Excludes embedded and generated content and makes tests harder. |
+| Auto-accept terms | Hides a legal/side-effectful provisioning acknowledgement. |
 
 ## URL Bases
 
@@ -137,6 +254,11 @@ Request body:
 
 This endpoint is observed/internal. It returns the temporary account and claim
 credentials used by the remaining calls.
+
+The `claim.url` field is the claim address returned by the SDK as
+`DeployResult.ClaimURL`. It should be shown to the caller when they need to keep
+the deployment, but it should not be written to shared logs because it carries a
+short-lived claim token.
 
 ## Asset Manifest
 
@@ -316,11 +438,15 @@ state only and is not required by the API flow.
 - Temporary API and claim tokens are short-lived secrets.
 - The SDK requires an explicit `AcceptTerms` flag before it calls the
   provisioning endpoint.
+- The claim address is returned as `DeployResult.ClaimURL`; treat it as secret
+  material because it embeds or references the claim token.
 - Tests that hit Cloudflare live APIs should be opt-in and should deploy only
   throwaway content.
 
 ## References
 
 - Cloudflare Drop page: `https://www.cloudflare.com/drop/`
+- Cloudflare Drop changelog, published 2026-07-08:
+  `https://developers.cloudflare.com/changelog/post/2026-07-08-cloudflare-drag-and-drop/`
 - Cloudflare Workers Static Assets direct upload:
   `https://developers.cloudflare.com/workers/static-assets/direct-upload/`

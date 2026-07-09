@@ -2,6 +2,7 @@ package dropclient
 
 import (
 	"bytes"
+	"cmp"
 	"context"
 	"crypto/rand"
 	"encoding/hex"
@@ -12,16 +13,9 @@ import (
 	"time"
 )
 
-func New(opts Options) *Client {
-	client, err := NewClient(WithOptions(opts))
-	if err != nil {
-		panic(err)
-	}
-	return client
-}
-
-func NewClient(options ...Option) (*Client, error) {
-	var opts Options
+// New creates a Cloudflare Drop client.
+func New(options ...ClientOption) (*Client, error) {
+	var opts clientOptions
 	for _, option := range options {
 		if option == nil {
 			continue
@@ -30,22 +24,16 @@ func NewClient(options ...Option) (*Client, error) {
 			return nil, err
 		}
 	}
-	apiBaseURL := strings.TrimRight(opts.APIBaseURL, "/")
-	if apiBaseURL == "" {
-		apiBaseURL = DefaultAPIBaseURL
-	}
+	apiBaseURL := cmp.Or(strings.TrimRight(opts.APIBaseURL, "/"), DefaultAPIBaseURL)
 	httpClient := opts.HTTPClient
 	if httpClient == nil {
-		httpClient = &http.Client{Timeout: 60 * time.Second}
+		httpClient = &http.Client{
+			Timeout:   60 * time.Second,
+			Transport: defaultTransport(),
+		}
 	}
-	userAgent := opts.UserAgent
-	if userAgent == "" {
-		userAgent = "cf-drop-go/0.1"
-	}
-	workersDevDomain := opts.WorkersDevDomain
-	if workersDevDomain == "" {
-		workersDevDomain = DefaultWorkersDevDomain
-	}
+	userAgent := cmp.Or(opts.UserAgent, "cf-drop-go/0.1")
+	workersDevDomain := cmp.Or(opts.WorkersDevDomain, DefaultWorkersDevDomain)
 	scriptName := opts.ScriptName
 	if scriptName == nil {
 		scriptName = randomScriptName
@@ -60,50 +48,58 @@ func NewClient(options ...Option) (*Client, error) {
 	}, nil
 }
 
-func WithOptions(value Options) Option {
-	return func(opts *Options) error {
-		*opts = value
-		return nil
-	}
-}
-
-func WithAPIBaseURL(value string) Option {
-	return func(opts *Options) error {
+// WithAPIBaseURL overrides the Cloudflare API base URL.
+func WithAPIBaseURL(value string) ClientOption {
+	return func(opts *clientOptions) error {
 		opts.APIBaseURL = value
 		return nil
 	}
 }
 
-func WithHTTPClient(value *http.Client) Option {
-	return func(opts *Options) error {
+// WithHTTPClient uses a caller-provided HTTP client.
+func WithHTTPClient(value *http.Client) ClientOption {
+	return func(opts *clientOptions) error {
+		if value == nil {
+			return fmt.Errorf("http client cannot be nil")
+		}
 		opts.HTTPClient = value
 		return nil
 	}
 }
 
-func WithUserAgent(value string) Option {
-	return func(opts *Options) error {
+// WithUserAgent overrides the SDK User-Agent header.
+func WithUserAgent(value string) ClientOption {
+	return func(opts *clientOptions) error {
 		opts.UserAgent = value
 		return nil
 	}
 }
 
-func WithWorkersDevDomain(value string) Option {
-	return func(opts *Options) error {
+// WithWorkersDevDomain overrides the workers.dev suffix used to build result URLs.
+func WithWorkersDevDomain(value string) ClientOption {
+	return func(opts *clientOptions) error {
 		opts.WorkersDevDomain = value
 		return nil
 	}
 }
 
-func WithURLBuilder(value func(scriptName, subdomain string) string) Option {
-	return func(opts *Options) error {
+// WithURLBuilder overrides result URL construction.
+func WithURLBuilder(value func(scriptName, subdomain string) string) ClientOption {
+	return func(opts *clientOptions) error {
+		if value == nil {
+			return fmt.Errorf("url builder cannot be nil")
+		}
 		opts.URLBuilder = value
 		return nil
 	}
 }
 
-func WithScriptName(value func() (string, error)) Option {
-	return func(opts *Options) error {
+// WithScriptNameGenerator overrides random Drop script name generation.
+func WithScriptNameGenerator(value func(context.Context) (string, error)) ClientOption {
+	return func(opts *clientOptions) error {
+		if value == nil {
+			return fmt.Errorf("script name generator cannot be nil")
+		}
 		opts.ScriptName = value
 		return nil
 	}
@@ -135,7 +131,7 @@ func (c *Client) newRequest(ctx context.Context, method, rawURL string, body *by
 	return req, nil
 }
 
-func randomScriptName() (string, error) {
+func randomScriptName(context.Context) (string, error) {
 	var b [6]byte
 	if _, err := rand.Read(b[:]); err != nil {
 		return "", err

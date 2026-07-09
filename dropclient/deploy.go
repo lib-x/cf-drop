@@ -4,38 +4,34 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"strings"
 	"time"
 )
 
-func (c *Client) DeployDirectory(ctx context.Context, dir string, opts DeployOptions) (*DeployResult, error) {
-	files, err := ReadDirectory(dir)
+// Deploy uploads a Source to Cloudflare Drop and returns the public preview URL.
+func (c *Client) Deploy(ctx context.Context, source Source, options ...DeployOption) (*DeployResult, error) {
+	if ctx == nil {
+		return nil, fmt.Errorf("context cannot be nil")
+	}
+	opts, err := parseDeployOptions(options)
 	if err != nil {
 		return nil, err
 	}
-	return c.deployFiles(ctx, files, opts)
-}
-
-func (c *Client) deployFiles(ctx context.Context, files []File, opts DeployOptions) (*DeployResult, error) {
-	if !opts.AcceptTerms {
+	if !opts.acceptTerms {
 		return nil, ErrTermsNotAccepted
 	}
-	if !opts.SkipValidation {
-		if err := ValidateDropFiles(files); err != nil {
-			return nil, err
-		}
-	}
-	manifest, assets, err := BuildManifest(files)
+	manifest, assets, err := buildManifest(ctx, source)
 	if err != nil {
 		return nil, err
 	}
-	scriptName := opts.ScriptName
+	scriptName := opts.scriptName
 	if scriptName == "" {
-		scriptName, err = c.scriptName()
+		scriptName, err = c.scriptName(ctx)
 		if err != nil {
 			return nil, err
 		}
 	}
-	compatibilityDate := defaultString(opts.CompatibilityDate, DefaultCompatibilityDate)
+	compatibilityDate := defaultString(opts.compatibilityDate, DefaultCompatibilityDate)
 
 	challenge, err := c.requestChallenge(ctx)
 	if err != nil {
@@ -70,7 +66,7 @@ func (c *Client) deployFiles(ctx context.Context, files []File, opts DeployOptio
 	if completionJWT == "" {
 		return nil, fmt.Errorf("asset upload completed without completion token")
 	}
-	if !opts.SkipPreviewAssets {
+	if !opts.skipPreviewAssets {
 		if err := c.uploadPreviewAssets(ctx, creds, scriptName, completionJWT, manifest, assets, compatibilityDate); err != nil {
 			return nil, err
 		}
@@ -99,14 +95,115 @@ func (c *Client) deployFiles(ctx context.Context, files []File, opts DeployOptio
 		Manifest:      manifest,
 		UploadBuckets: session.Buckets,
 	}
-	if opts.VerifyHTTP {
-		access, err := c.WaitUntilAccessible(ctx, result.URL, opts.VerifyTimeout)
+	if opts.verifyHTTP {
+		access, err := c.WaitUntilAccessible(ctx, result.URL, opts.verifyTimeout)
 		if err != nil {
 			return nil, err
 		}
 		result.Access = access
 	}
 	return result, nil
+}
+
+func parseDeployOptions(options []DeployOption) (deployOptions, error) {
+	var opts deployOptions
+	for _, option := range options {
+		if option == nil {
+			continue
+		}
+		if err := option(&opts); err != nil {
+			return deployOptions{}, err
+		}
+	}
+	return opts, nil
+}
+
+// AcceptTerms acknowledges Cloudflare's terms for this Drop provisioning call.
+func AcceptTerms() DeployOption {
+	return func(opts *deployOptions) error {
+		opts.acceptTerms = true
+		return nil
+	}
+}
+
+// WithScriptName sets the Worker script name used in the final workers.dev URL.
+func WithScriptName(value string) DeployOption {
+	return func(opts *deployOptions) error {
+		value = strings.TrimSpace(value)
+		if value == "" {
+			return fmt.Errorf("script name cannot be empty")
+		}
+		opts.scriptName = value
+		return nil
+	}
+}
+
+// WithProvisioningClient overrides the observed Drop provisioning client field.
+func WithProvisioningClient(value string) DeployOption {
+	return func(opts *deployOptions) error {
+		opts.client = value
+		return nil
+	}
+}
+
+// WithProvisioningSource overrides the observed Drop provisioning source field.
+func WithProvisioningSource(value string) DeployOption {
+	return func(opts *deployOptions) error {
+		opts.source = value
+		return nil
+	}
+}
+
+// WithTermsOfServiceURL overrides the terms URL sent to the provisioning endpoint.
+func WithTermsOfServiceURL(value string) DeployOption {
+	return func(opts *deployOptions) error {
+		opts.termsOfService = value
+		return nil
+	}
+}
+
+// WithPrivacyPolicyURL overrides the privacy URL sent to the provisioning endpoint.
+func WithPrivacyPolicyURL(value string) DeployOption {
+	return func(opts *deployOptions) error {
+		opts.privacyPolicy = value
+		return nil
+	}
+}
+
+// WithCompatibilityDate sets the Worker compatibility date.
+func WithCompatibilityDate(value string) DeployOption {
+	return func(opts *deployOptions) error {
+		opts.compatibilityDate = value
+		return nil
+	}
+}
+
+// SkipPreviewAssets skips the observed Drop preview asset mirror request.
+func SkipPreviewAssets() DeployOption {
+	return func(opts *deployOptions) error {
+		opts.skipPreviewAssets = true
+		return nil
+	}
+}
+
+// VerifyAccess makes Deploy poll the returned URL until it is reachable.
+func VerifyAccess() DeployOption {
+	return func(opts *deployOptions) error {
+		opts.verifyHTTP = true
+		return nil
+	}
+}
+
+// WithVerifyTimeout enables access verification with a custom timeout.
+func WithVerifyTimeout(value time.Duration) DeployOption {
+	return func(opts *deployOptions) error {
+		if value <= 0 {
+			return fmt.Errorf("verify timeout must be positive")
+		}
+		opts.verifyHTTP = true
+		opts.verifyTimeout = value
+		return nil
+	}
 }
 
 func credentialsFromProvision(result provisionResult) (credentials, error) {
@@ -131,6 +228,7 @@ func credentialsFromProvision(result provisionResult) (credentials, error) {
 	}, nil
 }
 
+// WaitUntilAccessible polls a public URL until it returns a 2xx or 3xx status.
 func (c *Client) WaitUntilAccessible(ctx context.Context, targetURL string, timeout time.Duration) (*AccessResult, error) {
 	if timeout <= 0 {
 		timeout = 90 * time.Second

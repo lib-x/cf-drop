@@ -32,8 +32,8 @@ func SolveChallenge(challenge challengeResult) (powSolution, error) {
 	current := sha256.Sum256(seed)
 	checkpoints := make([]byte, 0, (challenge.K+1)*sha256.Size)
 	checkpoints = append(checkpoints, current[:]...)
-	for i := 0; i < challenge.K; i++ {
-		for j := 0; j < challenge.G; j++ {
+	for range challenge.K {
+		for range challenge.G {
 			current = sha256.Sum256(current[:])
 		}
 		checkpoints = append(checkpoints, current[:]...)

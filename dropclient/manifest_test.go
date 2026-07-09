@@ -2,8 +2,12 @@ package dropclient
 
 import (
 	"errors"
-	"reflect"
+	"io"
+	"maps"
+	"slices"
+	"strings"
 	"testing"
+	"testing/fstest"
 )
 
 func TestBuildManifestHashes(t *testing.T) {
@@ -35,9 +39,16 @@ func TestBuildManifestHashes(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			manifest, assets, err := BuildManifest([]File{{Path: tt.path, Content: []byte(tt.content)}})
+			source := FromBytes(tt.path, []byte(tt.content))
+			if tt.path != "index.html" {
+				source = FromAssets(
+					testAsset("index.html", "<!doctype html>", "text/html"),
+					testAsset(tt.path, tt.content, contentTypeForPath(tt.path)),
+				)
+			}
+			manifest, assets, err := buildManifest(t.Context(), source)
 			if err != nil {
-				t.Fatalf("BuildManifest returned error: %v", err)
+				t.Fatalf("buildManifest returned error: %v", err)
 			}
 			got := manifest["/"+tt.path]
 			if got != tt.want {
@@ -54,65 +65,108 @@ func TestBuildManifestHashes(t *testing.T) {
 	}
 }
 
-func TestValidateDropFiles(t *testing.T) {
+func TestBuildManifestValidation(t *testing.T) {
 	tests := []struct {
-		name    string
-		files   []File
-		wantErr error
+		name         string
+		source       Source
+		wantErr      error
+		wantContains string
 	}{
 		{
 			name: "accepts root index",
-			files: []File{
-				{Path: "index.html", Content: []byte("<!doctype html>")},
-			},
+			source: FromBytes(
+				"index.html",
+				[]byte("<!doctype html>"),
+				WithContentType("text/html; charset=utf-8"),
+			),
 		},
 		{
-			name: "accepts one-level index",
-			files: []File{
-				{Path: "site/index.html", Content: []byte("<!doctype html>")},
-			},
+			name:   "accepts one-level index",
+			source: FromBytes("site/index.html", []byte("<!doctype html>")),
 		},
 		{
-			name: "rejects missing index",
-			files: []File{
-				{Path: "style.css", Content: []byte("body{}")},
-			},
+			name:    "rejects missing index",
+			source:  FromBytes("style.css", []byte("body{}")),
 			wantErr: ErrIndexMissing,
 		},
 		{
 			name:    "rejects empty input",
-			wantErr: ErrNoFiles,
+			source:  FromAssets(),
+			wantErr: ErrNoAssets,
+		},
+		{
+			name: "rejects path traversal",
+			source: FromBytes(
+				"../index.html",
+				[]byte("<!doctype html>"),
+			),
+			wantContains: "escapes root",
+		},
+		{
+			name: "rejects duplicate normalized paths",
+			source: FromAssets(
+				testAsset("index.html", "<!doctype html>", "text/html"),
+				testAsset("/index.html", "<!doctype html>", "text/html"),
+			),
+			wantContains: "duplicate asset path",
+		},
+		{
+			name: "rejects declared file size above limit",
+			source: FromAssets(Asset{
+				Path: "index.html",
+				Size: MaxFileSize + 1,
+				Open: func() (io.ReadCloser, error) {
+					return io.NopCloser(strings.NewReader("<!doctype html>")), nil
+				},
+			}),
+			wantContains: "exceeds drop max file size",
+		},
+		{
+			name: "rejects declared size mismatch",
+			source: FromAssets(Asset{
+				Path: "index.html",
+				Size: 999,
+				Open: func() (io.ReadCloser, error) {
+					return io.NopCloser(strings.NewReader("<!doctype html>")), nil
+				},
+			}),
+			wantContains: "declared size",
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			err := ValidateDropFiles(tt.files)
-			if tt.wantErr == nil {
+			_, err := BuildManifest(t.Context(), tt.source)
+			if tt.wantErr == nil && tt.wantContains == "" {
 				if err != nil {
-					t.Fatalf("ValidateDropFiles returned error: %v", err)
+					t.Fatalf("BuildManifest returned error: %v", err)
 				}
 				return
 			}
-			if !errors.Is(err, tt.wantErr) {
-				t.Fatalf("ValidateDropFiles error = %v, want %v", err, tt.wantErr)
+			if tt.wantErr != nil && !errors.Is(err, tt.wantErr) {
+				t.Fatalf("BuildManifest error = %v, want %v", err, tt.wantErr)
+			}
+			if tt.wantContains != "" && (err == nil || !strings.Contains(err.Error(), tt.wantContains)) {
+				t.Fatalf("BuildManifest error = %v, want message containing %q", err, tt.wantContains)
 			}
 		})
 	}
 }
 
-func TestReadDirectory(t *testing.T) {
-	dir := t.TempDir()
-	writeTestFile(t, dir, "index.html", "<!doctype html><h1>ok</h1>")
-	writeTestFile(t, dir, "assets/app.js", "console.log('ok')")
+func TestFromFSBuildsSortedManifest(t *testing.T) {
+	source := FromFS(fstest.MapFS{
+		"index.html":     {Data: []byte("<!doctype html><h1>ok</h1>")},
+		"assets/app.js":  {Data: []byte("console.log('ok')")},
+		"assets/app.css": {Data: []byte("body{}")},
+	})
 
-	files, err := ReadDirectory(dir)
+	manifest, err := BuildManifest(t.Context(), source)
 	if err != nil {
-		t.Fatalf("ReadDirectory returned error: %v", err)
+		t.Fatalf("BuildManifest returned error: %v", err)
 	}
-	gotPaths := []string{files[0].Path, files[1].Path}
-	wantPaths := []string{"assets/app.js", "index.html"}
-	if !reflect.DeepEqual(gotPaths, wantPaths) {
+	gotPaths := slices.Sorted(maps.Keys(manifest))
+	wantPaths := []string{"/assets/app.css", "/assets/app.js", "/index.html"}
+	if !slices.Equal(gotPaths, wantPaths) {
 		t.Fatalf("paths = %#v, want %#v", gotPaths, wantPaths)
 	}
 }

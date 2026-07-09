@@ -5,7 +5,12 @@ info:
   description: >
     Observed API contract used by Cloudflare Drop. Provisioning endpoints are
     internal/observed. Workers assets upload endpoints are documented by
-    Cloudflare Workers Static Assets direct upload docs.
+    Cloudflare Workers Static Assets direct upload docs. Official product
+    behavior: folder or ZIP uploads produce a one-hour temporary preview that
+    can be claimed to keep the deployment.
+externalDocs:
+  description: Cloudflare Drop changelog
+  url: https://developers.cloudflare.com/changelog/post/2026-07-08-cloudflare-drag-and-drop/
 servers:
   - url: https://api.cloudflare.com/client/v4
 paths:
@@ -275,22 +280,30 @@ components:
       properties:
         account:
           type: object
+          description: Temporary account credentials.
           properties:
             id:
               type: string
             apiToken:
               type: string
+              description: Temporary bearer token. Treat as secret.
             expiresAt:
               type: string
+              format: date-time
         claim:
           type: object
+          description: Claim metadata for keeping the temporary deployment.
           properties:
             token:
               type: string
+              description: Temporary claim token. Treat as secret.
             url:
               type: string
+              format: uri
+              description: Claim address returned by the SDK as DeployResult.ClaimURL.
             expiresAt:
               type: string
+              format: date-time
     ProvisionEnvelope:
       allOf:
         - $ref: "#/components/schemas/EnvelopeBase"

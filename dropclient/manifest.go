@@ -1,14 +1,14 @@
 package dropclient
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
 	"fmt"
+	"io"
 	"mime"
-	"os"
-	"path/filepath"
-	"sort"
+	"path"
 	"strings"
 )
 
@@ -20,25 +20,76 @@ type assetPayload struct {
 	Size        int64
 }
 
-func BuildManifest(files []File) (Manifest, map[string]assetPayload, error) {
-	if len(files) == 0 {
-		return nil, nil, ErrNoFiles
+func BuildManifest(ctx context.Context, source Source) (Manifest, error) {
+	manifest, _, err := buildManifest(ctx, source)
+	return manifest, err
+}
+
+func buildManifest(ctx context.Context, source Source) (Manifest, map[string]assetPayload, error) {
+	if ctx == nil {
+		return nil, nil, fmt.Errorf("context cannot be nil")
 	}
-	manifest := make(Manifest, len(files))
-	assets := make(map[string]assetPayload, len(files))
-	for _, file := range files {
-		normalized, err := normalizeAssetPath(file.Path)
-		if err != nil {
-			return nil, nil, err
+	if source == nil {
+		return nil, nil, ErrNoAssets
+	}
+	manifest := make(Manifest)
+	assets := make(map[string]assetPayload)
+	var count int
+	var total int64
+	hasIndex := false
+	err := source.WalkAssets(ctx, func(asset Asset) error {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
 		}
-		encoded := base64.StdEncoding.EncodeToString(file.Content)
-		hash := assetHash(encoded, extension(file.Path))
-		size := int64(len(file.Content))
+		normalized, err := normalizeAssetPath(asset.Path)
+		if err != nil {
+			return err
+		}
+		if _, exists := manifest[normalized]; exists {
+			return fmt.Errorf("duplicate asset path %q", normalized)
+		}
+		if asset.Open == nil {
+			return fmt.Errorf("asset %q cannot be opened", normalized)
+		}
+		if asset.Size >= 0 && asset.Size > MaxFileSize {
+			return fmt.Errorf("%s is %d bytes, exceeds drop max file size %d", normalized, asset.Size, MaxFileSize)
+		}
+		reader, err := asset.Open()
+		if err != nil {
+			return fmt.Errorf("open asset %s: %w", normalized, err)
+		}
+		content, readErr := io.ReadAll(io.LimitReader(reader, MaxFileSize+1))
+		closeErr := reader.Close()
+		if readErr != nil {
+			return fmt.Errorf("read asset %s: %w", normalized, readErr)
+		}
+		if closeErr != nil {
+			return fmt.Errorf("close asset %s: %w", normalized, closeErr)
+		}
+		size := int64(len(content))
+		if size > MaxFileSize {
+			return fmt.Errorf("%s is %d bytes, exceeds drop max file size %d", normalized, size, MaxFileSize)
+		}
+		if asset.Size >= 0 && asset.Size != size {
+			return fmt.Errorf("%s declared size %d but read %d bytes", normalized, asset.Size, size)
+		}
+		count++
+		if count > MaxAssetCount {
+			return fmt.Errorf("asset count %d exceeds drop limit %d", count, MaxAssetCount)
+		}
+		total += size
+		if total > MaxTotalSize {
+			return fmt.Errorf("total size %d exceeds drop total size %d", total, MaxTotalSize)
+		}
+		encoded := base64.StdEncoding.EncodeToString(content)
+		hash := assetHash(encoded, extension(normalized))
 		manifest[normalized] = ManifestEntry{Hash: hash, Size: size}
 		if _, ok := assets[hash]; !ok {
-			contentType := file.ContentType
+			contentType := asset.ContentType
 			if contentType == "" {
-				contentType = contentTypeForPath(file.Path)
+				contentType = contentTypeForPath(normalized)
 			}
 			assets[hash] = assetPayload{
 				Path:        normalized,
@@ -48,83 +99,26 @@ func BuildManifest(files []File) (Manifest, map[string]assetPayload, error) {
 				Size:        size,
 			}
 		}
+		if isAllowedIndexPath(normalized) {
+			hasIndex = true
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, nil, err
+	}
+	if count == 0 {
+		return nil, nil, ErrNoAssets
+	}
+	if !hasIndex {
+		return nil, nil, ErrIndexMissing
 	}
 	return manifest, assets, nil
 }
 
-func ReadDirectory(root string) ([]File, error) {
-	var files []File
-	err := filepath.WalkDir(root, func(path string, entry os.DirEntry, err error) error {
-		if err != nil {
-			return err
-		}
-		if entry.IsDir() {
-			return nil
-		}
-		info, err := entry.Info()
-		if err != nil {
-			return err
-		}
-		if !info.Mode().IsRegular() {
-			return nil
-		}
-		content, err := os.ReadFile(path)
-		if err != nil {
-			return err
-		}
-		rel, err := filepath.Rel(root, path)
-		if err != nil {
-			return err
-		}
-		files = append(files, File{
-			Path:        filepath.ToSlash(rel),
-			Content:     content,
-			ContentType: contentTypeForPath(rel),
-		})
-		return nil
-	})
-	if err != nil {
-		return nil, err
-	}
-	sort.Slice(files, func(i, j int) bool { return files[i].Path < files[j].Path })
-	return files, nil
-}
-
-func ValidateDropFiles(files []File) error {
-	if len(files) == 0 {
-		return ErrNoFiles
-	}
-	if len(files) > MaxFileCount {
-		return fmt.Errorf("file count %d exceeds drop limit %d", len(files), MaxFileCount)
-	}
-	var total int64
-	hasIndex := false
-	for _, file := range files {
-		size := int64(len(file.Content))
-		if size > MaxFileSize {
-			return fmt.Errorf("%s is %d bytes, exceeds drop max file size %d", file.Path, size, MaxFileSize)
-		}
-		total += size
-		if total > MaxTotalSize {
-			return fmt.Errorf("total size %d exceeds drop total size %d", total, MaxTotalSize)
-		}
-		normalized, err := normalizeAssetPath(file.Path)
-		if err != nil {
-			return err
-		}
-		if isAllowedIndexPath(normalized) {
-			hasIndex = true
-		}
-	}
-	if !hasIndex {
-		return ErrIndexMissing
-	}
-	return nil
-}
-
-func isAllowedIndexPath(path string) bool {
-	path = strings.TrimPrefix(filepath.ToSlash(path), "/")
-	parts := strings.Split(path, "/")
+func isAllowedIndexPath(assetPath string) bool {
+	assetPath = strings.TrimPrefix(assetPath, "/")
+	parts := strings.Split(assetPath, "/")
 	if len(parts) == 1 {
 		return strings.EqualFold(parts[0], "index.html")
 	}
@@ -136,8 +130,8 @@ func assetHash(encodedContent, ext string) string {
 	return hex.EncodeToString(sum[:])[:32]
 }
 
-func extension(path string) string {
-	base := filepath.Base(path)
+func extension(assetPath string) string {
+	base := path.Base(assetPath)
 	idx := strings.LastIndex(base, ".")
 	if idx == -1 || idx == len(base)-1 {
 		return ""
@@ -145,31 +139,33 @@ func extension(path string) string {
 	return base[idx+1:]
 }
 
-func normalizeAssetPath(path string) (string, error) {
-	path = strings.TrimSpace(filepath.ToSlash(path))
-	if path == "" || path == "." || path == "/" {
-		return "", fmt.Errorf("invalid asset path %q", path)
+func normalizeAssetPath(assetPath string) (string, error) {
+	assetPath = strings.TrimSpace(strings.ReplaceAll(assetPath, "\\", "/"))
+	if assetPath == "" || assetPath == "." || assetPath == "/" {
+		return "", fmt.Errorf("invalid asset path %q", assetPath)
 	}
-	path = strings.TrimPrefix(path, "/")
-	parts := strings.Split(path, "/")
-	clean := make([]string, 0, len(parts))
-	for _, part := range parts {
+	assetPath = strings.TrimPrefix(assetPath, "/")
+	clean := make([]string, 0, strings.Count(assetPath, "/")+1)
+	for part := range strings.SplitSeq(assetPath, "/") {
 		if part == "" || part == "." {
 			continue
 		}
 		if part == ".." {
-			return "", fmt.Errorf("asset path %q escapes root", path)
+			return "", fmt.Errorf("asset path %q escapes root", assetPath)
+		}
+		if strings.ContainsRune(part, 0) {
+			return "", fmt.Errorf("asset path %q contains NUL byte", assetPath)
 		}
 		clean = append(clean, part)
 	}
 	if len(clean) == 0 {
-		return "", fmt.Errorf("invalid asset path %q", path)
+		return "", fmt.Errorf("invalid asset path %q", assetPath)
 	}
 	return "/" + strings.Join(clean, "/"), nil
 }
 
-func contentTypeForPath(path string) string {
-	ext := filepath.Ext(path)
+func contentTypeForPath(assetPath string) string {
+	ext := path.Ext(assetPath)
 	if ext == "" {
 		return "application/octet-stream"
 	}

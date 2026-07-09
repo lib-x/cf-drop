@@ -9,8 +9,8 @@ import (
 	"time"
 )
 
-func WithProxyURL(rawURL string) Option {
-	return func(opts *Options) error {
+func WithProxyURL(rawURL string) ClientOption {
+	return func(opts *clientOptions) error {
 		if strings.TrimSpace(rawURL) == "" {
 			return nil
 		}
@@ -35,7 +35,7 @@ func WithProxyURL(rawURL string) Option {
 	}
 }
 
-func WithSOCKS5Proxy(address string) Option {
+func WithSOCKS5Proxy(address string) ClientOption {
 	return WithProxyURL("socks5://" + address)
 }
 
